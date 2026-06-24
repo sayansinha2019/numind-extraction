@@ -11,8 +11,11 @@ services:
       INPUT_DIR: /data/input
       OUTPUT_DIR: /data/output
       HF_HOME: /cache/huggingface
-      PDF_DPI: "300"
-      TEMPLATE_BATCH_SIZE: "1"
+      PDF_DPI: "400"
+      TEMPLATE_BATCH_SIZE: "0"
+      EXTRACTION_BATCH_SIZE: "6"
+      MAX_NEW_TOKENS: "8192"
+      AGGRESSIVE_GPU_CLEANUP: "false"
       GPU_OOM_RETRIES: "2"
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     deploy:

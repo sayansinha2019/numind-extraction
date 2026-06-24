@@ -157,8 +157,8 @@ class TestExcelExportScenarios(unittest.TestCase):
 
         pages = sheet_table(wb["Pages"])
         self.assertEqual(pages[0], ["Page", "Field", "Value"])
-        self.assertIn([1, "address", "123 Main"], pages)
-        self.assertIn([2, "policy.id", "P-55"], pages)
+        self.assertIn(["1", "address", "123 Main"], pages)
+        self.assertIn(["2", "policy.id", "P-55"], pages)
         wb.close()
 
     def test_top_level_table_sheet(self) -> None:
@@ -252,8 +252,8 @@ class TestExcelExportScenarios(unittest.TestCase):
         self.assertIn("Errors", wb.sheetnames)
 
         pages = sheet_table(wb["Pages"])
-        self.assertIn([2, "status", "error"], pages)
-        self.assertIn([2, "error", "GPU timeout"], pages)
+        self.assertIn(["2", "status", "error"], pages)
+        self.assertIn(["2", "error", "GPU timeout"], pages)
 
         errors = sheet_table(wb["Errors"])
         self.assertEqual(errors[1], ["extraction", "2", "GPU timeout"])

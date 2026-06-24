@@ -131,6 +131,16 @@ def _write_table_sheet(worksheet, rows: list[dict]) -> None:
     _autosize_columns(worksheet)
 
 
+def _page_label(page_entry: dict) -> str:
+    """Format one or more page numbers for Excel output."""
+    pages = page_entry.get("pages")
+    if pages:
+        return ", ".join(str(page) for page in pages)
+    if page_entry.get("page") is not None:
+        return str(page_entry["page"])
+    return ""
+
+
 def write_excel_from_extraction(
     extracted_data: dict,
     excel_path: Path,
@@ -162,16 +172,16 @@ def write_excel_from_extraction(
     )
     _write_header_row(pages_sheet, ["Page", "Field", "Value"])
     for page_entry in extracted_data.get("pages", []):
-        page_number = page_entry.get("page", "")
+        page_label = _page_label(page_entry)
         status = page_entry.get("status", "ok")
         if status != "ok":
-            pages_sheet.append([page_number, "status", status])
+            pages_sheet.append([page_label, "status", status])
             if page_entry.get("error"):
-                pages_sheet.append([page_number, "error", page_entry["error"]])
+                pages_sheet.append([page_label, "error", page_entry["error"]])
             continue
 
         for field, value in _flatten_fields(page_entry.get("data", {})):
-            pages_sheet.append([page_number, field, value])
+            pages_sheet.append([page_label, field, value])
     _autosize_columns(pages_sheet)
 
     errors = extracted_data.get("errors", [])

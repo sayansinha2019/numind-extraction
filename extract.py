@@ -20,18 +20,42 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", BASE_DIR / "input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", BASE_DIR / "output"))
 TEMPLATE_INSTRUCTION = (
-    "Generate a JSON template for this document page. "
-    "Include every field and nested section visible on this page."
+    "Generate a JSON template for this document. "
+    "Include every field, table, and nested section visible across all pages."
 )
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
-PDF_DPI = int(os.environ.get("PDF_DPI", "300"))
-TEMPLATE_BATCH_SIZE = max(1, int(os.environ.get("TEMPLATE_BATCH_SIZE", "1")))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "8192"))
+PDF_DPI = int(os.environ.get("PDF_DPI", "400"))
+TEMPLATE_BATCH_SIZE = int(os.environ.get("TEMPLATE_BATCH_SIZE", "0"))
+EXTRACTION_BATCH_SIZE = int(os.environ.get("EXTRACTION_BATCH_SIZE", "6"))
 GPU_OOM_RETRIES = int(os.environ.get("GPU_OOM_RETRIES", "2"))
+AGGRESSIVE_GPU_CLEANUP = os.environ.get("AGGRESSIVE_GPU_CLEANUP", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+def effective_batch_size(batch_size: int, page_count: int) -> int:
+    """Treat 0 as 'all pages in one batch' for high-VRAM processing."""
+    if batch_size <= 0:
+        return max(page_count, 1)
+    return batch_size
 
 
 def load_model_and_tokenizer():
     """Load NuExtract3 model and tokenizer (via AutoProcessor) onto GPU."""
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
     print(f"Loading model {MODEL_ID}...")
+    print(
+        f"Quality profile: PDF_DPI={PDF_DPI}, "
+        f"template_batch={TEMPLATE_BATCH_SIZE or 'all'}, "
+        f"extraction_batch={EXTRACTION_BATCH_SIZE or 'all'}, "
+        f"max_tokens={MAX_NEW_TOKENS}"
+    )
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     tokenizer = processor
     model = AutoModelForImageTextToText.from_pretrained(
@@ -50,6 +74,12 @@ def clear_gpu_cache() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def maybe_clear_gpu_cache(*, force: bool = False) -> None:
+    """Clear GPU memory when running in conservative mode or on demand."""
+    if force or AGGRESSIVE_GPU_CLEANUP:
+        clear_gpu_cache()
 
 
 def pdf_page_count(pdf_path: Path) -> int:
@@ -167,7 +197,7 @@ def apply_chat_template_and_generate(
             del generated_ids
         if inputs is not None:
             del inputs
-        clear_gpu_cache()
+        maybe_clear_gpu_cache()
 
 
 def parse_json_output(text: str) -> dict:
@@ -298,10 +328,10 @@ def generate_template(
 
 
 def extract_data(
-    model, tokenizer, image: Image.Image, template_text: str
+    model, tokenizer, images: Image.Image | list[Image.Image], template_text: str
 ) -> str:
-    """Extract structured data from a single page image."""
-    messages = build_image_message(image)
+    """Extract structured data from one or more page images."""
+    messages = build_image_message(images)
     return apply_chat_template_and_generate(
         model,
         tokenizer,
@@ -325,12 +355,13 @@ def close_images(images: list[Image.Image]) -> None:
 def build_document_template(
     model, tokenizer, pdf_path: Path, page_count: int
 ) -> tuple[str, list[dict]]:
-    """Build a unified template by scanning every page in small GPU-safe batches."""
+    """Build a unified template by scanning pages in configurable batches."""
     merged_template: dict = {}
     errors: list[dict] = []
+    batch_size = effective_batch_size(TEMPLATE_BATCH_SIZE, page_count)
 
-    for batch_start in range(1, page_count + 1, TEMPLATE_BATCH_SIZE):
-        batch_end = min(batch_start + TEMPLATE_BATCH_SIZE - 1, page_count)
+    for batch_start in range(1, page_count + 1, batch_size):
+        batch_end = min(batch_start + batch_size - 1, page_count)
         page_numbers = list(range(batch_start, batch_end + 1))
         images = load_page_images(pdf_path, page_numbers)
 
@@ -339,7 +370,11 @@ def build_document_template(
                 f"Building template from page(s) "
                 f"{page_numbers[0]}-{page_numbers[-1]}/{page_count}..."
             )
-            template_text = generate_template(model, tokenizer, images[0] if len(images) == 1 else images)
+            template_text = generate_template(
+                model,
+                tokenizer,
+                images[0] if len(images) == 1 else images,
+            )
             merged_template = deep_merge_template(
                 merged_template,
                 parse_json_output(template_text),
@@ -358,7 +393,7 @@ def build_document_template(
             )
         finally:
             close_images(images)
-            clear_gpu_cache()
+            maybe_clear_gpu_cache()
 
     if not merged_template:
         raise ValueError(f"Could not build a template for {pdf_path.name}")
@@ -373,38 +408,52 @@ def extract_document_pages(
     page_count: int,
     template_text: str,
 ) -> tuple[list[dict], dict, list[dict]]:
-    """Extract every page individually and merge values across pages."""
+    """Extract pages in batches and merge values across the full document."""
     pages_data: list[dict] = []
     merged_data: dict = {}
     errors: list[dict] = []
+    batch_size = effective_batch_size(EXTRACTION_BATCH_SIZE, page_count)
 
-    for page_number in range(1, page_count + 1):
-        image = pdf_page_to_image(pdf_path, page_number)
-        page_entry = {"page": page_number, "status": "ok", "data": {}}
+    for batch_start in range(1, page_count + 1, batch_size):
+        batch_end = min(batch_start + batch_size - 1, page_count)
+        page_numbers = list(range(batch_start, batch_end + 1))
+        images = load_page_images(pdf_path, page_numbers)
+        page_entry = {
+            "pages": page_numbers,
+            "status": "ok",
+            "data": {},
+        }
 
         try:
-            print(f"Extracting page {page_number}/{page_count}...")
-            extracted_text = extract_data(model, tokenizer, image, template_text)
-            page_data = parse_json_output(extracted_text)
-            page_entry["data"] = page_data
-            merged_data = deep_merge_data(merged_data, page_data)
+            print(
+                f"Extracting page(s) {page_numbers[0]}-{page_numbers[-1]}/{page_count}..."
+            )
+            extracted_text = extract_data(
+                model,
+                tokenizer,
+                images[0] if len(images) == 1 else images,
+                template_text,
+            )
+            batch_data = parse_json_output(extracted_text)
+            page_entry["data"] = batch_data
+            merged_data = deep_merge_data(merged_data, batch_data)
         except Exception as exc:
             page_entry["status"] = "error"
             page_entry["error"] = str(exc)
             errors.append(
                 {
                     "stage": "extraction",
-                    "page": page_number,
+                    "pages": page_numbers,
                     "error": str(exc),
                 }
             )
             print(
-                f"Extraction failed for page {page_number}: {exc}",
+                f"Extraction failed for pages {page_numbers}: {exc}",
                 file=sys.stderr,
             )
         finally:
-            image.close()
-            clear_gpu_cache()
+            close_images(images)
+            maybe_clear_gpu_cache()
 
         pages_data.append(page_entry)
 
