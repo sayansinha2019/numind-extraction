@@ -1,0 +1,27 @@
+services:
+  extractor:
+    build: .
+    container_name: numind-extractor
+    restart: unless-stopped
+    volumes:
+      - ./input:/data/input
+      - ./output:/data/output
+      - hf_cache:/cache/huggingface
+    environment:
+      INPUT_DIR: /data/input
+      OUTPUT_DIR: /data/output
+      HF_HOME: /cache/huggingface
+      PDF_DPI: "300"
+      TEMPLATE_BATCH_SIZE: "1"
+      GPU_OOM_RETRIES: "2"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf_cache:

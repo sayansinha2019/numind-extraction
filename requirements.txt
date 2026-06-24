@@ -1,0 +1,7 @@
+transformers
+torch
+Pillow
+pdf2image
+accelerate
+watchdog
+openpyxl
