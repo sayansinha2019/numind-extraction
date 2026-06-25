@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV PYTHONUNBUFFERED=1 \
     INPUT_DIR=/data/input \
@@ -13,8 +13,6 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-RUN pip install --no-cache-dir --no-build-isolation causal-conv1d flash-linear-attention
 
 COPY extract.py watcher.py excel_export.py ./
 

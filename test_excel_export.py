@@ -7,6 +7,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from excel_export import (
+    SINGLE_SHEET_NAME,
     _flatten_fields,
     _format_cell_value,
     _is_table,
@@ -16,15 +17,77 @@ from excel_export import (
 from extract import deep_merge_data, merge_strings
 
 
-def sheet_to_dict(ws) -> dict[str, str]:
-    """Read a two-column Field/Value sheet into a dictionary."""
-    rows = list(ws.iter_rows(min_row=2, values_only=True))
-    return {row[0]: row[1] for row in rows if row[0] is not None}
+def _trim_row(row: tuple[object, ...]) -> list[object]:
+    values = list(row)
+    while values and values[-1] is None:
+        values.pop()
+    return values
 
 
 def sheet_table(ws) -> list[list[object]]:
     """Read a worksheet as a list of rows."""
-    return [list(row) for row in ws.iter_rows(values_only=True)]
+    return [_trim_row(row) for row in ws.iter_rows(values_only=True)]
+
+
+def _section_start(rows: list[list[object]], section_name: str) -> int:
+    for index, row in enumerate(rows):
+        if row and row[0] == section_name:
+            return index
+    raise AssertionError(f"Section {section_name!r} not found")
+
+
+def section_to_dict(ws, section_name: str = "Summary") -> dict[str, str]:
+    """Read a Field/Value section into a dictionary."""
+    rows = sheet_table(ws)
+    start = _section_start(rows, section_name)
+    header = rows[start + 1]
+    if header[:2] != ["Field", "Value"]:
+        raise AssertionError(f"Expected Field/Value headers in {section_name!r}")
+    result: dict[str, str] = {}
+    for row in rows[start + 2 :]:
+        if not row or row[0] is None:
+            break
+        if row[0] in {"Summary", "Pages", "Errors"} or (
+            len(row) > 1 and row[1] is None and row[0] not in result
+        ):
+            break
+        result[row[0]] = row[1] if len(row) > 1 else ""
+    return result
+
+
+def section_table(ws, section_name: str) -> list[list[object]]:
+    """Read a table section (title row, header row, then data rows)."""
+    rows = sheet_table(ws)
+    start = _section_start(rows, section_name)
+    table_rows: list[list[object]] = []
+    for row in rows[start + 1 :]:
+        if not row or row[0] is None:
+            break
+        if row[0] in {"Summary", "Pages", "Errors"}:
+            break
+        table_rows.append(row)
+    return table_rows
+
+
+def pages_section(ws) -> list[list[object]]:
+    """Read the Pages section including its header row."""
+    rows = sheet_table(ws)
+    start = _section_start(rows, "Pages")
+    section_rows: list[list[object]] = []
+    for row in rows[start + 1 :]:
+        if not row or row[0] is None:
+            break
+        if row[0] == "Errors":
+            break
+        section_rows.append(row)
+    return section_rows
+
+
+def errors_section(ws) -> list[list[object]]:
+    """Read the Errors section including its header row."""
+    rows = sheet_table(ws)
+    start = _section_start(rows, "Errors")
+    return [row for row in rows[start + 1 :] if row and row[0] is not None]
 
 
 class TestExcelHelpers(unittest.TestCase):
@@ -94,6 +157,11 @@ class TestExcelExportScenarios(unittest.TestCase):
     def _workbook(self, excel_path: Path):
         return load_workbook(excel_path, read_only=True, data_only=True)
 
+    def _sheet(self, excel_path: Path):
+        wb = self._workbook(excel_path)
+        self.assertEqual(wb.sheetnames, [SINGLE_SHEET_NAME])
+        return wb, wb[SINGLE_SHEET_NAME]
+
     def test_simple_flat_document(self) -> None:
         excel_path = self._export(
             {
@@ -109,8 +177,8 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["source_file"], "doc.pdf")
         self.assertEqual(summary["page_count"], "1")
         self.assertEqual(summary["invoice_number"], "INV-100")
@@ -148,20 +216,20 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["patient_name"], "John Doe")
         self.assertEqual(summary["address"], "123 Main Street, NYC")
         self.assertEqual(summary["policy.provider"], "Acme")
         self.assertEqual(summary["policy.id"], "P-55")
 
-        pages = sheet_table(wb["Pages"])
+        pages = pages_section(sheet)
         self.assertEqual(pages[0], ["Page", "Field", "Value"])
         self.assertIn(["1", "address", "123 Main"], pages)
         self.assertIn(["2", "policy.id", "P-55"], pages)
         wb.close()
 
-    def test_top_level_table_sheet(self) -> None:
+    def test_top_level_table_section(self) -> None:
         excel_path = self._export(
             {
                 "page_count": 1,
@@ -176,15 +244,14 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        self.assertIn("line_items", wb.sheetnames)
-        table = sheet_table(wb["line_items"])
+        wb, sheet = self._sheet(excel_path)
+        table = section_table(sheet, "line_items")
         self.assertEqual(table[0], ["description", "qty", "price"])
         self.assertEqual(table[1], ["Widget", "2", "10"])
         self.assertEqual(table[2], ["Gadget", "1", "25"])
         wb.close()
 
-    def test_nested_table_sheet(self) -> None:
+    def test_nested_table_section(self) -> None:
         excel_path = self._export(
             {
                 "page_count": 1,
@@ -201,17 +268,16 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["invoice.number"], "INV-300")
-        self.assertIn("invoice.line_items", wb.sheetnames)
 
-        table = sheet_table(wb["invoice.line_items"])
+        table = section_table(sheet, "invoice.line_items")
         self.assertEqual(table[0], ["sku", "amount"])
         self.assertEqual(table[1], ["A1", "100"])
         wb.close()
 
-    def test_multiple_table_sheets(self) -> None:
+    def test_multiple_table_sections(self) -> None:
         excel_path = self._export(
             {
                 "page_count": 1,
@@ -223,12 +289,12 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        self.assertIn("items", wb.sheetnames)
-        self.assertIn("payments", wb.sheetnames)
+        wb, sheet = self._sheet(excel_path)
+        self.assertEqual(section_table(sheet, "items")[1], ["A"])
+        self.assertEqual(section_table(sheet, "payments")[1], ["card", "10"])
         wb.close()
 
-    def test_failed_page_and_errors_sheet(self) -> None:
+    def test_failed_page_and_errors_section(self) -> None:
         excel_path = self._export(
             {
                 "page_count": 2,
@@ -248,14 +314,14 @@ class TestExcelExportScenarios(unittest.TestCase):
                 ],
             }
         )
-        wb = self._workbook(excel_path)
-        self.assertIn("Errors", wb.sheetnames)
+        wb, sheet = self._sheet(excel_path)
 
-        pages = sheet_table(wb["Pages"])
+        pages = pages_section(sheet)
         self.assertIn(["2", "status", "error"], pages)
         self.assertIn(["2", "error", "GPU timeout"], pages)
 
-        errors = sheet_table(wb["Errors"])
+        errors = errors_section(sheet)
+        self.assertEqual(errors[0], ["Stage", "Page(s)", "Error"])
         self.assertEqual(errors[1], ["extraction", "2", "GPU timeout"])
         self.assertEqual(errors[2], ["template", "1", "partial template issue"])
         wb.close()
@@ -269,11 +335,13 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["source_file"], "doc.pdf")
         self.assertEqual(summary["page_count"], "0")
-        self.assertNotIn("Errors", wb.sheetnames)
+
+        rows = sheet_table(sheet)
+        self.assertNotIn("Errors", [row[0] for row in rows if row])
         wb.close()
 
     def test_boolean_and_null_fields(self) -> None:
@@ -289,8 +357,8 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["active"], "true")
         self.assertEqual(summary["archived"], "false")
         self.assertIn(summary.get("notes"), ("", None))
@@ -325,13 +393,13 @@ class TestExcelExportScenarios(unittest.TestCase):
             name="invoice.pdf",
         )
 
-        wb = self._workbook(excel_path)
-        summary = sheet_to_dict(wb["Summary"])
+        wb, sheet = self._sheet(excel_path)
+        summary = section_to_dict(sheet)
         self.assertEqual(summary["vendor"], "Acme Corp")
         self.assertEqual(summary["address"], "123 Main Street, Boston")
         self.assertEqual(summary["total"], "99.5")
 
-        table = sheet_table(wb["line_items"])
+        table = section_table(sheet, "line_items")
         self.assertEqual(len(table), 3)  # header + 2 rows
         self.assertEqual(table[1][0], "Paper")
         self.assertEqual(table[2][0], "Ink")
@@ -351,8 +419,8 @@ class TestExcelExportScenarios(unittest.TestCase):
                 "errors": [],
             }
         )
-        wb = self._workbook(excel_path)
-        table = sheet_table(wb["rows"])
+        wb, sheet = self._sheet(excel_path)
+        table = section_table(sheet, "rows")
         self.assertEqual(table[0], ["name", "meta"])
         self.assertEqual(table[1][1], "{'color': 'red'}")
         wb.close()

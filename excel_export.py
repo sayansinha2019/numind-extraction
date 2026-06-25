@@ -9,6 +9,7 @@ from openpyxl.utils import get_column_letter
 
 INVALID_SHEET_CHARS = re.compile(r"[\[\]\*\?:/\\]")
 MAX_SHEET_NAME_LEN = 31
+SINGLE_SHEET_NAME = "Extraction"
 
 
 def _sanitize_sheet_name(name: str, used_names: set[str]) -> str:
@@ -47,7 +48,7 @@ def _format_cell_value(value: object) -> str:
 
 
 def _is_table(value: object) -> bool:
-    """Return True when a value should be exported as a table sheet."""
+    """Return True when a value should be exported as a table section."""
     return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
 
 
@@ -110,25 +111,32 @@ def _autosize_columns(worksheet) -> None:
         worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 60)
 
 
-def _write_header_row(worksheet, headers: list[str]) -> None:
+def _append_header_row(worksheet, headers: list[str]) -> None:
     worksheet.append(headers)
-    for cell in worksheet[1]:
+    for cell in worksheet[worksheet.max_row]:
         cell.font = Font(bold=True)
 
 
-def _write_key_value_sheet(worksheet, rows: list[tuple[str, str]]) -> None:
-    _write_header_row(worksheet, ["Field", "Value"])
+def _append_section_title(worksheet, title: str) -> None:
+    if worksheet.max_row > 1 or worksheet.cell(1, 1).value:
+        worksheet.append([])
+    worksheet.append([title])
+    for cell in worksheet[worksheet.max_row]:
+        cell.font = Font(bold=True)
+
+
+def _append_key_value_rows(worksheet, rows: list[tuple[str, str]]) -> None:
+    _append_header_row(worksheet, ["Field", "Value"])
     for field, value in rows:
         worksheet.append([field, value if value is not None else ""])
-    _autosize_columns(worksheet)
 
 
-def _write_table_sheet(worksheet, rows: list[dict]) -> None:
+def _append_table_rows(worksheet, table_name: str, rows: list[dict]) -> None:
+    _append_section_title(worksheet, table_name)
     columns = _collect_table_columns(rows)
-    _write_header_row(worksheet, columns)
+    _append_header_row(worksheet, columns)
     for row in rows:
         worksheet.append([_format_cell_value(row.get(column, "")) for column in columns])
-    _autosize_columns(worksheet)
 
 
 def _page_label(page_entry: dict) -> str:
@@ -147,56 +155,49 @@ def write_excel_from_extraction(
     *,
     source_name: str,
 ) -> None:
-    """Write the final merged extraction result to an Excel workbook."""
+    """Write the final merged extraction result to a single-sheet Excel workbook."""
     workbook = Workbook()
-    used_sheet_names: set[str] = set()
-
-    summary_sheet = workbook.active
-    summary_sheet.title = _sanitize_sheet_name("Summary", used_sheet_names)
+    sheet = workbook.active
+    sheet.title = SINGLE_SHEET_NAME
 
     summary_rows = [
         ("source_file", source_name),
         ("page_count", _format_cell_value(extracted_data.get("page_count", ""))),
     ]
     summary_rows.extend(_flatten_fields(extracted_data.get("data", {})))
-    _write_key_value_sheet(summary_sheet, summary_rows)
+    _append_section_title(sheet, "Summary")
+    _append_key_value_rows(sheet, summary_rows)
 
     document_data = extracted_data.get("data", {})
     for table_name, table_rows in _iter_tables(document_data):
-        sheet_name = _sanitize_sheet_name(table_name, used_sheet_names)
-        table_sheet = workbook.create_sheet(title=sheet_name)
-        _write_table_sheet(table_sheet, table_rows)
+        _append_table_rows(sheet, table_name, table_rows)
 
-    pages_sheet = workbook.create_sheet(
-        title=_sanitize_sheet_name("Pages", used_sheet_names)
-    )
-    _write_header_row(pages_sheet, ["Page", "Field", "Value"])
+    _append_section_title(sheet, "Pages")
+    _append_header_row(sheet, ["Page", "Field", "Value"])
     for page_entry in extracted_data.get("pages", []):
         page_label = _page_label(page_entry)
         status = page_entry.get("status", "ok")
         if status != "ok":
-            pages_sheet.append([page_label, "status", status])
+            sheet.append([page_label, "status", status])
             if page_entry.get("error"):
-                pages_sheet.append([page_label, "error", page_entry["error"]])
+                sheet.append([page_label, "error", page_entry["error"]])
             continue
 
         for field, value in _flatten_fields(page_entry.get("data", {})):
-            pages_sheet.append([page_label, field, value])
-    _autosize_columns(pages_sheet)
+            sheet.append([page_label, field, value])
 
     errors = extracted_data.get("errors", [])
     if errors:
-        errors_sheet = workbook.create_sheet(
-            title=_sanitize_sheet_name("Errors", used_sheet_names)
-        )
-        _write_header_row(errors_sheet, ["Stage", "Page(s)", "Error"])
+        _append_section_title(sheet, "Errors")
+        _append_header_row(sheet, ["Stage", "Page(s)", "Error"])
         for error in errors:
             pages = error.get("pages")
             if pages is None and error.get("page") is not None:
                 pages = [error["page"]]
             page_label = ", ".join(str(page) for page in pages) if pages else ""
-            errors_sheet.append([error.get("stage", ""), page_label, error.get("error", "")])
-        _autosize_columns(errors_sheet)
+            sheet.append([error.get("stage", ""), page_label, error.get("error", "")])
+
+    _autosize_columns(sheet)
 
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(excel_path)
